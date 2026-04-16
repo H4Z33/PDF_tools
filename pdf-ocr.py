@@ -275,35 +275,79 @@ def extract_blocks(pdf_path, max_pages=None):
                     page_formulas.append({"num": num, "latex": latex})
         
         # 2. Programmatic Inline Math Detection
-        # We scan for superscripts, subscripts, and symbols natively via fonts
-        mathy_spans = []
+        # We group adjacent spans on the same line that are mathy or scripts to find replacements
+        inline_replacements = []
         try:
             dict_data = page.get_text("dict")
             for b in dict_data.get("blocks", []):
-                if b["type"] != 0: continue # Only text
-                # Find the dominant font size in the block
-                sizes = [s["size"] for l in b["lines"] for s in l["spans"]]
-                if not sizes: continue
-                dom_size = max(set(sizes), key=sizes.count)
+                if b["type"] != 0: continue
+                # Block-level dominant size (using most frequent size)
+                all_sizes = [round(s["size"], 1) for l in b["lines"] for s in l["spans"]]
+                if not all_sizes: continue
+                dom_size = max(set(all_sizes), key=all_sizes.count)
                 
                 for line in b.get("lines", []):
+                    # Find line-level baseline (common y-origin)
+                    origins = [round(s["origin"][1], 1) for s in line.get("spans", [])]
+                    base_y = max(set(origins), key=origins.count) if origins else 0
+                    
+                    current_raw = []
+                    current_latex = []
+                    is_in_math = False
+                    
                     for s in line.get("spans", []):
-                        text = s["text"].strip()
-                        if not text: continue
+                        text = s["text"]
+                        streq = text.strip()
+                        if not streq:
+                            if is_in_math: 
+                                current_raw.append(text)
+                                current_latex.append(" ")
+                            continue
                         
-                        # Logic: If smaller than dominant and shifted Up/Down OR is math font
-                        is_script = (s["size"] < dom_size * 0.9)
-                        is_math = any(f in s["font"].lower() for f in ("math", "symbol", "cmsy", "cmmi", "pazo")) or RE_MATH_CHAR.search(text)
+                        f_lower = s["font"].lower()
+                        is_math_font = any(f in f_lower for f in ("math", "symbol", "cmsy", "cmmi", "pazo"))
+                        is_math_char = RE_MATH_CHAR.search(streq) is not None
+                        # Use stricter size threshold (0.8) and check for vertical shift
+                        is_script = (s["size"] < dom_size * 0.85)
                         
-                        if is_script or is_math:
-                            mathy_spans.append({
-                                "text": text,
-                                "bbox": s["bbox"],
-                                "type": "script" if is_script else "symbol",
-                                "flags": s["flags"]
-                            })
+                        if is_math_font or is_math_char or is_script:
+                            is_in_math = True
+                            current_raw.append(text)
+                            val = streq
+                            if is_script:
+                                dy = s["origin"][1] - base_y
+                                if dy < -1: # Upward shift -> Superscript
+                                    val = f"^{{{streq}}}" if "^" not in streq else streq
+                                elif dy > 1: # Downward shift -> Subscript
+                                    val = f"_{{{streq}}}" if "_" not in streq else streq
+                            current_latex.append(val)
+                        else:
+                            if is_in_math:
+                                raw_seq = "".join(current_raw).strip()
+                                lat_seq = "".join(current_latex).strip()
+                                if len(raw_seq) > 0 and (RE_MATH_CHAR.search(raw_seq) or "^" in lat_seq or "_" in lat_seq):
+                                    inline_replacements.append((raw_seq, f"${lat_seq}$"))
+                                current_raw = []
+                                current_latex = []
+                                is_in_math = False
+                                
+                    if is_in_math:
+                        raw_seq = "".join(current_raw).strip()
+                        lat_seq = "".join(current_latex).strip()
+                        if len(raw_seq) > 0 and (RE_MATH_CHAR.search(raw_seq) or "^" in lat_seq or "_" in lat_seq):
+                            inline_replacements.append((raw_seq, f"${lat_seq}$"))
         except:
             pass
+        
+        # Deduplicate and sort by raw length descending
+        final_repls = []
+        seen_raw = set()
+        for raw, lat in sorted(inline_replacements, key=lambda x: len(x[0]), reverse=True):
+            if raw in seen_raw: continue
+            if len(raw) == 1 and not RE_MATH_CHAR.search(raw): continue
+            final_repls.append((raw, lat))
+            seen_raw.add(raw)
+        inline_replacements = final_repls
                 
         route_to_llm = False
         if has_caption:
@@ -349,15 +393,18 @@ def extract_blocks(pdf_path, max_pages=None):
                            has_math = True
                            form_idx += 1
                     
-                    # New: Programmatic Inline Math Repair
-                    if not has_math:
-                        # Find spans that belong to this block and apply semantic wrapping
-                        for ms in mathy_spans:
-                            # We check if the span text is in our block
-                            if ms["text"] in b_text:
-                                if ms["type"] == "symbol" and len(ms["text"]) < 10:
-                                    b_text = b_text.replace(ms["text"], f"${ms['text']}$")
-                                    has_math = True
+                    # New: Programmatic Inline Math Repair (Fuzzy Matching)
+                    if not has_math and RE_INLINE_SEED.search(b_text):
+                        for raw, lat in inline_replacements:
+                            # Create a fuzzy pattern that allows for variable spacing
+                            pattern = re.escape(raw).replace(r'\ ', r'\s*')
+                            if re.search(pattern, b_text):
+                                b_text = re.sub(pattern, lat, b_text)
+                                has_math = True
+                        
+                        # Cleanup double dollars from overlap
+                        while "$$" in b_text:
+                            b_text = b_text.replace("$$", "$")
 
                     norm = normalize(b_text)
                     is_paging = False
@@ -434,15 +481,19 @@ def extract_blocks(pdf_path, max_pages=None):
                                 has_math = True
                                 matched = True
                                 break
+                    # Fallback to sequential if numbering check fails
                     if not matched and form_idx < len(page_formulas):
                         b_text = page_formulas[form_idx]["latex"]
                         has_math = True
                         form_idx += 1
-                elif not has_math:
-                     for ms in mathy_spans:
-                         if ms["text"] in b_text:
-                              if ms["type"] == "symbol" and len(ms["text"]) < 10:
-                                  b_text = b_text.replace(ms["text"], f"${ms['text']}$")
+                elif not has_math and RE_INLINE_SEED.search(b_text):
+                     for raw, lat in inline_replacements:
+                         pattern = re.escape(raw).replace(r'\ ', r'\s*')
+                         if re.search(pattern, b_text):
+                             b_text = re.sub(pattern, lat, b_text)
+                             has_math = True
+                     while "$$" in b_text:
+                         b_text = b_text.replace("$$", "$")
 
                 norm = normalize(b_text)
                 # Comprehensive Paging/Metadata check
