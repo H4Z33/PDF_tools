@@ -9,6 +9,8 @@ import fitz
 import pdfplumber
 import pandas as pd
 import pymupdf4llm
+from PIL import Image
+import io
 
 # ─────────────────────────────────────────
 # Constants & Compiled Regexes
@@ -34,7 +36,9 @@ RE_ISOLATED_META = re.compile(r"^(rev\.?\s*\d+|hoja:?\s*\d+|página\s*\d+|folio:
 RE_L1_ANCHOR = re.compile(r"^[\s*_#\-]*1\.[\s]")
 RE_DIGIT_START = re.compile(r"^[\s*_#\-]*\d+")
 RE_L1_CANDIDATE = re.compile(r"^[\s*_#\-]*\d+\.[\s]+[A-Z]")
-RE_FORMULA = re.compile(r'(?:[=+\-\u2212×x÷<>±∑∫√]|[\u03B1-\u03C9\u0391-\u03A9]).*\(\d+(\.\d+)?\)\s*$', re.UNICODE)
+RE_FORMULA = re.compile(r'(?:[=+\-\u2212×x÷<>±∑∫√]|[\u03B1-\u03C9\u0391-\u03A9])[\s\S]*\(\d+(\.\d+)?\)\s*$', re.UNICODE)
+RE_MATH_CHAR = re.compile(r'[\u2200-\u22FF\u2190-\u21FF\u2A00-\u2AFF\u0370-\u03FF]')
+RE_INLINE_SEED = re.compile(r'(?:[\u2200-\u22FF\u0370-\u03FF]|[\.\s][=<>±−×÷][\s\.]|[a-zA-Z]\s?[=<>±−×÷])')
 
 
 # ─────────────────────────────────────────
@@ -60,6 +64,40 @@ def normalize(text: str) -> str:
     # 4. Filter symbols and collapse whitespace
     text = RE_NON_WORD.sub(' ', text)
     return text.strip()
+
+
+# ─────────────────────────────────────────
+# Deep Learning Math Extractor
+# ─────────────────────────────────────────
+def texify_on_demand(page, b_data):
+    if "texify_predictor" not in globals():
+        from surya.foundation import FoundationPredictor
+        from surya.recognition import RecognitionPredictor
+        from surya.common.surya.schema import TaskNames
+        global texify_predictor, TaskNames_cls
+        TaskNames_cls = TaskNames
+        print("\n\n[OCR] Surya Convolutional Math Engine loading into GPU/Memory...")
+        texify_predictor = RecognitionPredictor(FoundationPredictor())
+
+    rect = fitz.Rect(b_data[:4])
+    rect.x0 = max(0, rect.x0 - 10)
+    rect.y0 = max(0, rect.y0 - 10)
+    rect.x1 += 10
+    rect.y1 += 10
+
+    try:
+        pix = page.get_pixmap(clip=rect, dpi=192)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        preds = texify_predictor(
+            [img],
+            [TaskNames_cls.block_without_boxes],
+            bboxes=[[[0, 0, img.width, img.height]]]
+        )
+        if preds and preds[0].text_lines:
+            return preds[0].text_lines[0].text
+    except Exception as e:
+        pass
+    return None
 
 
 # ─────────────────────────────────────────
@@ -219,13 +257,53 @@ def extract_blocks(pdf_path, max_pages=None):
         page = doc[i]
         page_num = i + 1
         
-        # 1. Quick Scan for Invisible Table Captions
+        # 1. Quick Scan for Invisible Table Captions and Native Formulas
         raw_text_blocks = [b for b in page.get_text("blocks") if b[6] == 0]
         has_caption = False
+        
+        # Pre-pass: Deep Learning Math Extraction
+        page_formulas = []
         for b in raw_text_blocks:
             if RE_CAPTION.match(b[4]):
                 has_caption = True
-                break
+            
+            if RE_FORMULA.search(b[4]):
+                latex = texify_on_demand(page, b)
+                if latex:
+                    m = re.search(r'\((\d+(\.\d+)?)\)', b[4])
+                    num = m.group(1) if m else "?"
+                    page_formulas.append({"num": num, "latex": latex})
+        
+        # 2. Programmatic Inline Math Detection
+        # We scan for superscripts, subscripts, and symbols natively via fonts
+        mathy_spans = []
+        try:
+            dict_data = page.get_text("dict")
+            for b in dict_data.get("blocks", []):
+                if b["type"] != 0: continue # Only text
+                # Find the dominant font size in the block
+                sizes = [s["size"] for l in b["lines"] for s in l["spans"]]
+                if not sizes: continue
+                dom_size = max(set(sizes), key=sizes.count)
+                
+                for line in b.get("lines", []):
+                    for s in line.get("spans", []):
+                        text = s["text"].strip()
+                        if not text: continue
+                        
+                        # Logic: If smaller than dominant and shifted Up/Down OR is math font
+                        is_script = (s["size"] < dom_size * 0.9)
+                        is_math = any(f in s["font"].lower() for f in ("math", "symbol", "cmsy", "cmmi", "pazo")) or RE_MATH_CHAR.search(text)
+                        
+                        if is_script or is_math:
+                            mathy_spans.append({
+                                "text": text,
+                                "bbox": s["bbox"],
+                                "type": "script" if is_script else "symbol",
+                                "flags": s["flags"]
+                            })
+        except:
+            pass
                 
         route_to_llm = False
         if has_caption:
@@ -247,25 +325,55 @@ def extract_blocks(pdf_path, max_pages=None):
                 table_count += text.count("|---")
                 
                 raw_chunks = [b.strip() for b in text.split("\n\n") if b.strip()]
-                for b in raw_chunks:
-                    if RE_OMITTED_PIC.match(b):
-                        continue
+                form_idx = 0
+                for b_text in raw_chunks:
+                    # Math Injection targeting LLM garbled strings OR omitted pictures
+                    has_math = False
                     
-                    norm = normalize(b)
+                    if RE_OMITTED_PIC.match(b_text) and form_idx < len(page_formulas):
+                        b_text = page_formulas[form_idx]["latex"]
+                        has_math = True
+                        form_idx += 1
+                    elif RE_FORMULA.search(b_text):
+                        m = re.search(r'\((\d+(\.\d+)?)\)', b_text)
+                        matched = False
+                        if m:
+                            for f in page_formulas:
+                                if f["num"] == m.group(1):
+                                    b_text = f["latex"]
+                                    has_math = True
+                                    matched = True
+                                    break
+                        if not matched and form_idx < len(page_formulas):
+                           b_text = page_formulas[form_idx]["latex"]
+                           has_math = True
+                           form_idx += 1
+                    
+                    # New: Programmatic Inline Math Repair
+                    if not has_math:
+                        # Find spans that belong to this block and apply semantic wrapping
+                        for ms in mathy_spans:
+                            # We check if the span text is in our block
+                            if ms["text"] in b_text:
+                                if ms["type"] == "symbol" and len(ms["text"]) < 10:
+                                    b_text = b_text.replace(ms["text"], f"${ms['text']}$")
+                                    has_math = True
+
+                    norm = normalize(b_text)
                     is_paging = False
                     if not norm.strip():
                         is_paging = True
-                    elif b.isdigit() and len(b) < 4:
+                    elif b_text.isdigit() and len(b_text) < 4:
                         is_paging = True
-                    elif RE_ISOLATED_META.match(b):
+                    elif RE_ISOLATED_META.match(b_text):
                         is_paging = True
                         
-                    btype = identify_block_type(b, norm, toc_map)
+                    btype = "formula" if has_math else identify_block_type(b_text, norm, toc_map)
                     
                     blocks.append({
                         "page": page_num,
-                        "content": b,
-                        "raw": b,
+                        "content": b_text,
+                        "raw": b_text,
                         "block_type": btype,
                         "dropped": is_paging,
                         "drop_reason": "paging" if is_paging else None,
@@ -303,27 +411,55 @@ def extract_blocks(pdf_path, max_pages=None):
             
             # Split by double newline as requested
             raw_blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+            form_idx = 0 # Need to track this here too
             
-            for b in raw_blocks:
-                if RE_OMITTED_PIC.match(b):
-                    continue
+            for b_text in raw_blocks:
+                if RE_OMITTED_PIC.match(b_text):
+                    # In fast branch this is rare but possible if pictures are enabled
+                    if form_idx < len(page_formulas):
+                        b_text = page_formulas[form_idx]["latex"]
+                        has_math = True
+                        form_idx += 1
+                    else: continue
+                    
+                # Math Injection targeting fast C-str
+                has_math = False
+                if RE_FORMULA.search(b_text):
+                    m = re.search(r'\((\d+(\.\d+)?)\)', b_text)
+                    matched = False
+                    if m:
+                        for f in page_formulas:
+                            if f["num"] == m.group(1):
+                                b_text = f["latex"]
+                                has_math = True
+                                matched = True
+                                break
+                    if not matched and form_idx < len(page_formulas):
+                        b_text = page_formulas[form_idx]["latex"]
+                        has_math = True
+                        form_idx += 1
+                elif not has_math:
+                     for ms in mathy_spans:
+                         if ms["text"] in b_text:
+                              if ms["type"] == "symbol" and len(ms["text"]) < 10:
+                                  b_text = b_text.replace(ms["text"], f"${ms['text']}$")
 
-                norm = normalize(b)
+                norm = normalize(b_text)
                 # Comprehensive Paging/Metadata check
                 is_paging = False
                 if not norm.strip():
                     is_paging = True
-                elif b.isdigit() and len(b) < 4:
+                elif b_text.isdigit() and len(b_text) < 4:
                     is_paging = True
-                elif RE_ISOLATED_META.match(b):
+                elif RE_ISOLATED_META.match(b_text):
                     is_paging = True
 
-                btype = identify_block_type(b, norm, toc_map)
+                btype = "formula" if has_math else identify_block_type(b_text, norm, toc_map)
 
                 blocks.append({
                     "page": page_num,
-                    "content": b,
-                    "raw": b,
+                    "content": b_text,
+                    "raw": b_text,
                     "block_type": btype,
                     "dropped": is_paging,
                     "drop_reason": "paging" if is_paging else None,
@@ -457,7 +593,7 @@ def run(pdf_path, out_path="output.json", max_pages=None):
     blocks = renumber(blocks)
     
     if out_path == "output.json":
-        out_path = os.path.splitext(pdf_path)[0] + "_ext.json"
+        out_path = os.path.splitext(pdf_path)[0] + "_ocr.json"
 
     # Final cleanup of metadata fields
     final_output = []
