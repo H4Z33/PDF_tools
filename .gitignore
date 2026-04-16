@@ -1,0 +1,9 @@
+/.vscode
+/blocks_raw.json
+/data
+/output.json
+/output.md
+/pdf4llm.md
+/scratch
+/test_files
+/__pycache__
