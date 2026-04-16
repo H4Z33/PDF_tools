@@ -23,17 +23,17 @@ RE_NUMBERS = re.compile(r'\b\d+\b')
 RE_NON_WORD = re.compile(r'[^\w\s]')
 
 RE_HEADING_NUM = re.compile(r"^[\s*_#\-]*(\d+(\.\d+)+)\b")
-RE_HEADING_SINGLE = re.compile(r"^[\s*_#\-]*(\d+)[\.\s]")
+RE_HEADING_SINGLE = re.compile(r"^[\s*_#\-]*(\d+)\.[\s]")
 RE_MARKDOWN_HEADING = re.compile(r"^(#+)\s+")
-RE_CAPTION = re.compile(r"^\s*[*_#]*\s*(table|tabla|cuadro|figure|figura|illustration|ilustracion)\b", re.IGNORECASE)
+RE_CAPTION = re.compile(r"^\s*[*_#]*\s*(table|tabla|cuadro|figure|figura|illustration|ilustracion|listing|algorithm)\b", re.IGNORECASE)
 RE_LIST_BULLET = re.compile(r"^\s*[-*•]\s+")
 RE_LIST_ENUM = re.compile(r"^\s*\(?[a-zA-Z\d]+[\)\.]\s+")
 
 RE_OMITTED_PIC = re.compile(r"^\*\*==> picture \[\d+ x \d+\] intentionally omitted <==\*\*")
 RE_ISOLATED_META = re.compile(r"^(rev\.?\s*\d+|hoja:?\s*\d+|página\s*\d+|folio:?\s*\d+|pag\.?\s*\d+|hoja\s*#)$", re.IGNORECASE)
-RE_L1_ANCHOR = re.compile(r"^[\s*_#\-]*1[\.\s]")
+RE_L1_ANCHOR = re.compile(r"^[\s*_#\-]*1\.[\s]")
 RE_DIGIT_START = re.compile(r"^[\s*_#\-]*\d+")
-RE_L1_CANDIDATE = re.compile(r"^[\s*_#\-]*\d+[\.\s]+[A-Z]")
+RE_L1_CANDIDATE = re.compile(r"^[\s*_#\-]*\d+\.[\s]+[A-Z]")
 
 
 # ─────────────────────────────────────────
@@ -165,6 +165,27 @@ def refine_heading_hierarchy(blocks):
             elif len(content) < 100 and RE_L1_CANDIDATE.match(content):
                 b["block_type"] = "heading-l1"
                 
+    # 3. Contextual Reference Re-Classifier
+    current_major_context = ""
+    for b in blocks:
+        if b["dropped"]:
+            continue
+            
+        # Detect entry into the References section
+        if b["block_type"] == "heading-l0" or b["block_type"] == "heading-l1":
+            clean_str = re.sub(r'[^a-zA-Z]', '', b["content"].lower())
+            if clean_str.startswith("referenc") or clean_str.startswith("bibliogr"):
+                current_major_context = "references"
+            elif b["block_type"] == "heading-l0":
+                current_major_context = "body"
+                
+        # If inside References, lock down numbered arrays into reference types Instead of headings
+        if current_major_context == "references":
+            if b["block_type"].startswith("heading-l") and not (re.sub(r'[^a-zA-Z]', '', b["content"].lower()).startswith("referenc")):
+                b["block_type"] = "reference"
+            elif re.match(r"^[\s*_#\-]*\[?\d+\]?[\.\s]", b["content"]):
+                b["block_type"] = "reference"
+
     return blocks
 
 
@@ -435,7 +456,22 @@ def run(pdf_path, out_path="output.json", max_pages=None):
 
     # Final cleanup of metadata fields
     final_output = []
+    
+    # Precompile regex for fast final cleanup
+    re_markdown = re.compile(r'[*_#]+')
+    re_heading_num = re.compile(r'^[\s\-]*((?:Appendix\s+[A-Z]\.?|\d+(\.\d+)*)\.?)\s+', re.IGNORECASE)
+    
     for b in blocks:
+        if not b["dropped"] and b["block_type"] != "table":
+            cleaned = b["content"]
+            # 1. Strip structural markdown (bold, italic, headers)
+            cleaned = re_markdown.sub('', cleaned)
+            # 2. Strip redundant numbering from headings
+            if b["block_type"].startswith("heading") or b["block_type"] == "reference":
+                cleaned = re_heading_num.sub('', cleaned)
+
+            b["content"] = " ".join(cleaned.split())
+            
         clean_b = {k: v for k, v in b.items() if k not in ("raw", "drop_reason")}
         final_output.append(clean_b)
 
