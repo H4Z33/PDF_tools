@@ -34,7 +34,9 @@ RE_ISOLATED_META = re.compile(r"^(rev\.?\s*\d+|hoja:?\s*\d+|página\s*\d+|folio:
 RE_L1_ANCHOR = re.compile(r"^[\s*_#\-]*1\.[\s]")
 RE_DIGIT_START = re.compile(r"^[\s*_#\-]*\d+")
 RE_L1_CANDIDATE = re.compile(r"^[\s*_#\-]*\d+\.[\s]+[A-Z]")
-RE_FORMULA = re.compile(r'(?:[=+\-\u2212×x÷<>±∑∫√]|[\u03B1-\u03C9\u0391-\u03A9]).*\(\d+(\.\d+)?\)\s*$', re.UNICODE)
+RE_FORMULA = re.compile(r'(?:[=+\-\u2212×x÷<>±∑∫√ﬃ\ufb00-\ufb06]|[\u03B1-\u03C9\u0391-\u03A9])[\s\S]{0,600}[\(\[ð]\d+(\.\d+)?[\)\]]\s*$', re.UNICODE)
+RE_MATH_CHAR = re.compile(r'[\u2200-\u22FF\u2190-\u21FF\u2A00-\u2AFF\u0370-\u03FF]')
+RE_INLINE_SEED = re.compile(r'(?:[\u2200-\u22FF\u0370-\u03FF]|[\.\s][=<>±−×÷][\s\.]|[a-zA-Z]\s?[=<>±−×÷])')
 
 
 # ─────────────────────────────────────────
@@ -219,13 +221,107 @@ def extract_blocks(pdf_path, max_pages=None):
         page = doc[i]
         page_num = i + 1
         
-        # 1. Quick Scan for Invisible Table Captions
+        # 1. Detect Tables on the current page using pdfplumber (Early Pass)
+        page_p = doc_p.pages[i]
+        t_tab0 = time.time()
+        tables = page_p.find_tables()
+        t_table_ext += time.time() - t_tab0
+        
+        table_rects = [tab.bbox for tab in tables]
+        table_count += len(table_rects)
+        
+        def intersects_any_table(b_rect):
+            r1 = fitz.Rect(b_rect)
+            for t_bbox in table_rects:
+                if r1.intersects(fitz.Rect(t_bbox)):
+                    return True
+            return False
+
+        # 2. Quick Scan for Invisible Table Captions and Native Formulas
         raw_text_blocks = [b for b in page.get_text("blocks") if b[6] == 0]
         has_caption = False
-        for b in raw_text_blocks:
-            if RE_CAPTION.match(b[4]):
+        
+        # Pre-pass: Notation Restoration Radar (detects formulas fitz can see)
+        page_formulas = []
+        for j, b in enumerate(raw_text_blocks):
+            content = b[4]
+            if RE_CAPTION.match(content):
                 has_caption = True
-                break
+            
+            # Skip if it's in a table, is too long, or is a caption
+            if intersects_any_table(b[:4]):
+                continue
+            
+            # Anti-outlier: Tables often contain "Table" or many numbers
+            if "Table" in content or "|" in content or content.count('\n') > 10:
+                continue
+
+            if RE_FORMULA.search(content):
+                # Check for multiline math above this anchor
+                final_content = content
+                if j > 0:
+                    prev = raw_text_blocks[j-1][4]
+                    if any(c in prev for c in "=+\u2212×÷±") and not intersects_any_table(raw_text_blocks[j-1][:4]):
+                        if "Table" not in prev and "|" not in prev:
+                            final_content = prev + " " + content
+                
+                m = re.search(r'\((\d+(\.\d+)?)\)', content)
+                num = m.group(1) if m else "?"
+                page_formulas.append({"num": num, "text": final_content.strip()})
+
+        # 2. Programmatic Inline Math Detection
+        # We group adjacent spans on the same line that are mathy or scripts to find replacements
+        inline_replacements = []
+        try:
+            dict_data = page.get_text("dict")
+            for b in dict_data.get("blocks", []):
+                if b["type"] != 0: continue
+                all_sizes = [round(s["size"], 1) for l in b["lines"] for s in l["spans"]]
+                if not all_sizes: continue
+                dom_size = max(set(all_sizes), key=all_sizes.count)
+                
+                for line in b.get("lines", []):
+                    origins = [round(s["origin"][1], 1) for s in line.get("spans", [])]
+                    base_y = max(set(origins), key=origins.count) if origins else 0
+                    current_raw, current_latex, is_in_math = [], [], False
+                    
+                    for s in line.get("spans", []):
+                        text, streq = s["text"], s["text"].strip()
+                        if not streq:
+                            if is_in_math: current_raw.append(text); current_latex.append(" ")
+                            continue
+                        
+                        f_lower = s["font"].lower()
+                        is_math_font = any(f in f_lower for f in ("math", "symbol", "cmsy", "cmmi", "pazo"))
+                        is_math_char = RE_MATH_CHAR.search(streq) is not None
+                        is_script = (s["size"] < dom_size * 0.85)
+                        
+                        if is_math_font or is_math_char or is_script:
+                            is_in_math = True
+                            current_raw.append(text)
+                            val = streq
+                            if is_script:
+                                dy = s["origin"][1] - base_y
+                                if dy < -1: val = f"^{{{streq}}}" if "^" not in streq else streq
+                                elif dy > 1: val = f"_{{{streq}}}" if "_" not in streq else streq
+                            current_latex.append(val)
+                        else:
+                            if is_in_math:
+                                raw_seq, lat_seq = "".join(current_raw).strip(), "".join(current_latex).strip()
+                                if len(raw_seq) > 0 and (RE_MATH_CHAR.search(raw_seq) or "^" in lat_seq or "_" in lat_seq):
+                                    inline_replacements.append((raw_seq, f"${lat_seq}$"))
+                                current_raw, current_latex, is_in_math = [], [], False
+                    if is_in_math:
+                        raw_seq, lat_seq = "".join(current_raw).strip(), "".join(current_latex).strip()
+                        if len(raw_seq) > 0 and (RE_MATH_CHAR.search(raw_seq) or "^" in lat_seq or "_" in lat_seq):
+                            inline_replacements.append((raw_seq, f"${lat_seq}$"))
+        except: pass
+        
+        final_repls, seen_raw = [], set()
+        for raw, lat in sorted(inline_replacements, key=lambda x: len(x[0]), reverse=True):
+            if raw in seen_raw or (len(raw) == 1 and not RE_MATH_CHAR.search(raw)): continue
+            final_repls.append((raw, lat)); seen_raw.add(raw)
+        inline_replacements = final_repls
                 
         route_to_llm = False
         if has_caption:
@@ -247,9 +343,38 @@ def extract_blocks(pdf_path, max_pages=None):
                 table_count += text.count("|---")
                 
                 raw_chunks = [b.strip() for b in text.split("\n\n") if b.strip()]
+                form_idx = 0
                 for b in raw_chunks:
-                    if RE_OMITTED_PIC.match(b):
-                        continue
+                    has_math = False
+                    
+                    # 1. Notation Restoration Fallback (Fitz Radar Injection)
+                    if RE_OMITTED_PIC.match(b) and form_idx < len(page_formulas):
+                        b = page_formulas[form_idx]["text"]
+                        has_math = True
+                        form_idx += 1
+                    elif RE_FORMULA.search(b):
+                        m = re.search(r'\((\d+(\.\d+)?)\)', b)
+                        matched = False
+                        if m:
+                            for f in page_formulas:
+                                if f["num"] == m.group(1):
+                                    b = f["text"]
+                                    has_math = True
+                                    matched = True
+                                    break
+                        if not matched and form_idx < len(page_formulas):
+                           b = page_formulas[form_idx]["text"]
+                           has_math = True
+                           form_idx += 1
+                    
+                    # 2. Fuzzy Inline Math Repair (Programmatic)
+                    if not has_math and RE_INLINE_SEED.search(b):
+                        for raw, lat in inline_replacements:
+                            pattern = re.escape(raw).replace(r'\ ', r'\s*')
+                            if re.search(pattern, b):
+                                b = re.sub(pattern, lat, b)
+                                has_math = True
+                        while "$$" in b: b = b.replace("$$", "$")
                     
                     norm = normalize(b)
                     is_paging = False
@@ -260,7 +385,11 @@ def extract_blocks(pdf_path, max_pages=None):
                     elif RE_ISOLATED_META.match(b):
                         is_paging = True
                         
-                    btype = identify_block_type(b, norm, toc_map)
+                    # Anti-outlier check
+                    if has_math and ("Table" in b or "|" in b or b.count('\n') > 10):
+                        has_math = False
+
+                    btype = "formula" if has_math else identify_block_type(b, norm, toc_map)
                     
                     blocks.append({
                         "page": page_num,
@@ -272,23 +401,8 @@ def extract_blocks(pdf_path, max_pages=None):
                     })
             continue # Processed via LLM, skip the fast engines for this page!
 
-        # 2. STANDARD FAST ENGINE
-        page_p = doc_p.pages[i]
-        
-        # 1. Detect Tables on the current page using pdfplumber
-        t_tab0 = time.time()
-        tables = page_p.find_tables()
-        t_table_ext += time.time() - t_tab0
-        
-        table_rects = [tab.bbox for tab in tables]
-        table_count += len(table_rects)
-        
-        def intersects_any_table(b_rect):
-            r1 = fitz.Rect(b_rect)
-            for t_bbox in table_rects:
-                if r1.intersects(fitz.Rect(t_bbox)):
-                    return True
-            return False
+        # 3. STANDARD FAST ENGINE
+        # Tables were already detected in the Early Pass
 
         # 2. Extract standard text blocks
         # get_text("blocks") returns tuples: (x0, y0, x1, y1, "text", block_no, block_type)
@@ -303,10 +417,40 @@ def extract_blocks(pdf_path, max_pages=None):
             
             # Split by double newline as requested
             raw_blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+            form_idx = 0 # Need to track this here too
             
             for b in raw_blocks:
+                has_math = False
                 if RE_OMITTED_PIC.match(b):
-                    continue
+                    # In fast branch this is rare but possible if pictures are enabled
+                    if form_idx < len(page_formulas):
+                        b = page_formulas[form_idx]["text"]
+                        has_math = True
+                        form_idx += 1
+                    else: continue
+                    
+                # Notation Restoration Radar for Fast Branch
+                if RE_FORMULA.search(b):
+                    m = re.search(r'\((\d+(\.\d+)?)\)', b)
+                    matched = False
+                    if m:
+                        for f in page_formulas:
+                            if f["num"] == m.group(1):
+                                b = f["text"]
+                                has_math = True
+                                matched = True
+                                break
+                    if not matched and form_idx < len(page_formulas):
+                        b = page_formulas[form_idx]["text"]
+                        has_math = True
+                        form_idx += 1
+                elif not has_math and RE_INLINE_SEED.search(b):
+                     for raw, lat in inline_replacements:
+                         pattern = re.escape(raw).replace(r'\ ', r'\s*')
+                         if re.search(pattern, b):
+                             b = re.sub(pattern, lat, b)
+                             has_math = True
+                     while "$$" in b: b = b.replace("$$", "$")
 
                 norm = normalize(b)
                 # Comprehensive Paging/Metadata check
@@ -318,7 +462,11 @@ def extract_blocks(pdf_path, max_pages=None):
                 elif RE_ISOLATED_META.match(b):
                     is_paging = True
 
-                btype = identify_block_type(b, norm, toc_map)
+                # Anti-outlier check
+                if has_math and ("Table" in b or "|" in b or b.count('\n') > 10):
+                    has_math = False
+
+                btype = "formula" if has_math else identify_block_type(b, norm, toc_map)
 
                 blocks.append({
                     "page": page_num,
@@ -505,4 +653,9 @@ def run(pdf_path, out_path="output.json", max_pages=None):
 
 if __name__ == "__main__":
     import sys
-    run(sys.argv[1])
+    pdf = sys.argv[1]
+    pages = None
+    if "--max-pages" in sys.argv:
+        idx = sys.argv.index("--max-pages")
+        pages = int(sys.argv[idx+1])
+    run(pdf, max_pages=pages)
