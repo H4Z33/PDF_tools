@@ -28,6 +28,8 @@ RE_HEADING_NUM = re.compile(r"^[\s*_#\-]*(\d+(\.\d+)+)\b")
 RE_HEADING_SINGLE = re.compile(r"^[\s*_#\-]*(\d+)\.[\s]")
 RE_MARKDOWN_HEADING = re.compile(r"^(#+)\s+")
 RE_CAPTION = re.compile(r"^\s*[*_#]*\s*(table|tabla|cuadro|figure|figura|illustration|ilustracion|listing|algorithm)\b", re.IGNORECASE)
+RE_ABSTRACT = re.compile(r"^\s*[*_#]*\s*(abstract|resumen|summary)\b", re.IGNORECASE)
+RE_KEYWORDS = re.compile(r"^\s*[*_#]*\s*(keywords|palabras\s*clave|key\s*words)\b", re.IGNORECASE)
 RE_LIST_BULLET = re.compile(r"^\s*[-*•]\s+")
 RE_LIST_ENUM = re.compile(r"^\s*\(?[a-zA-Z\d]+[\)\.]\s+")
 
@@ -36,9 +38,7 @@ RE_ISOLATED_META = re.compile(r"^(rev\.?\s*\d+|hoja:?\s*\d+|página\s*\d+|folio:
 RE_L1_ANCHOR = re.compile(r"^[\s*_#\-]*1\.[\s]")
 RE_DIGIT_START = re.compile(r"^[\s*_#\-]*\d+")
 RE_L1_CANDIDATE = re.compile(r"^[\s*_#\-]*\d+\.[\s]+[A-Z]")
-RE_L2_ANCHOR = re.compile(r"^[\s*_#\-]*([A-Z]|\d+)\.(\d+)?[\s]")
-RE_FORMULA = re.compile(r'(?:[=+\-\u2212×x÷<>±∑∫√ﬃ]|[\u03B1-\u03C9\u0391-\u03A9])[\s\S]{0,600}[\(\[ð]\d+(\.\d+)?[\)\]]\s*$', re.UNICODE)
-RE_FORMULA_SHARD = re.compile(r'[=+\-\u2212×÷±∑∫√ﬃ]', re.UNICODE)
+RE_FORMULA = re.compile(r'(?:[=+\-\u2212×x÷<>±∑∫√]|[\u03B1-\u03C9\u0391-\u03A9])[\s\S]*\(\d+(\.\d+)?\)\s*$', re.UNICODE)
 RE_MATH_CHAR = re.compile(r'[\u2200-\u22FF\u2190-\u21FF\u2A00-\u2AFF\u0370-\u03FF]')
 RE_INLINE_SEED = re.compile(r'(?:[\u2200-\u22FF\u0370-\u03FF]|[\.\s][=<>±−×÷][\s\.]|[a-zA-Z]\s?[=<>±−×÷])')
 
@@ -140,6 +140,13 @@ def identify_block_type(content, norm, toc_map):
         elif label in ("figure", "figura"):
             return "figure-caption"
         return "illustration-caption"
+
+    # 3b. Abstract / Keywords
+    if RE_ABSTRACT.match(content):
+        return "abstract"
+    m_kw = RE_KEYWORDS.match(content)
+    if m_kw:
+        return "keywords"
 
     # 4. Table / ToC Matching
     if "|" in content:
@@ -259,68 +266,22 @@ def extract_blocks(pdf_path, max_pages=None):
         page = doc[i]
         page_num = i + 1
         
-        # 1. Detect Tables on the current page using pdfplumber (Early Pass)
-        page_p = doc_p.pages[i]
-        t_tab0 = time.time()
-        tables = page_p.find_tables()
-        t_table_ext += time.time() - t_tab0
-        
-        table_rects = [tab.bbox for tab in tables]
-        table_count += len(table_rects)
-        
-        def intersects_any_table(b_rect):
-            r1 = fitz.Rect(b_rect)
-            for t_bbox in table_rects:
-                if r1.intersects(fitz.Rect(t_bbox)):
-                    return True
-            return False
-
-        # 2. Quick Scan for Invisible Table Captions and Native Formulas
+        # 1. Quick Scan for Invisible Table Captions and Native Formulas
         raw_text_blocks = [b for b in page.get_text("blocks") if b[6] == 0]
         has_caption = False
         
-        # Pre-pass: Deep Learning Math Extraction (Radar with Shard Merging)
+        # Pre-pass: Deep Learning Math Extraction
         page_formulas = []
-        skip_shards = set()
-        for j, b in enumerate(raw_text_blocks):
-            if j in skip_shards: continue
-            content = b[4]
-            if RE_CAPTION.match(content):
+        for b in raw_text_blocks:
+            if RE_CAPTION.match(b[4]):
                 has_caption = True
             
-            # Skip if it's in a table or too long
-            if intersects_any_table(b[:4]):
-                continue
-
-            is_shard = RE_FORMULA_SHARD.search(content) is not None and len(content.strip()) < 100
-            is_anchored = RE_FORMULA.search(content) is not None
-
-            if is_anchored or is_shard:
-                # Geometric Merger: Look ahead for nearby shards
-                merged_bbox = list(b[:4])
-                shard_indices = [j]
-                
-                # Formula usually spans 2-8 contiguous blocks in fragmented PDFs
-                for k in range(j + 1, min(j + 8, len(raw_text_blocks))):
-                    next_b = raw_text_blocks[k]
-                    # Check vertical proximity (within 15 pts) AND (shard nature OR very short sequence)
-                    if (next_b[1] - merged_bbox[3] < 15) and (RE_FORMULA_SHARD.search(next_b[4]) or len(next_b[4].strip()) < 15):
-                        merged_bbox[0] = min(merged_bbox[0], next_b[0])
-                        merged_bbox[1] = min(merged_bbox[1], next_b[1])
-                        merged_bbox[2] = max(merged_bbox[2], next_b[2])
-                        merged_bbox[3] = max(merged_bbox[3], next_b[3])
-                        shard_indices.append(k)
-                    else:
-                        break
-                
-                # If we merged shards OR found an anchored formula, OCR it
-                if is_anchored or len(shard_indices) > 1:
-                    latex = texify_on_demand(page, merged_bbox)
-                    if latex:
-                        m = re.search(r'\((\d+(\.\d+)?)\)', content)
-                        num = m.group(1) if m else "?"
-                        page_formulas.append({"num": num, "latex": latex, "bbox": merged_bbox})
-                        for idx in shard_indices: skip_shards.add(idx)
+            if RE_FORMULA.search(b[4]):
+                latex = texify_on_demand(page, b)
+                if latex:
+                    m = re.search(r'\((\d+(\.\d+)?)\)', b[4])
+                    num = m.group(1) if m else "?"
+                    page_formulas.append({"num": num, "latex": latex})
         
         # 2. Programmatic Inline Math Detection
         # We group adjacent spans on the same line that are mathy or scripts to find replacements
@@ -418,35 +379,15 @@ def extract_blocks(pdf_path, max_pages=None):
                 
                 raw_chunks = [b.strip() for b in text.split("\n\n") if b.strip()]
                 form_idx = 0
-                last_was_math = False
                 for b_text in raw_chunks:
-                    # Clean out the picture text markers immediately
-                    b_text = re.sub(r"\*\*----- (Start|End) of picture text -----\*\*", "", b_text)
-                    b_text = b_text.replace("<br>", "\n").strip()
-                    if not b_text: continue
-
                     # Math Injection targeting LLM garbled strings OR omitted pictures
                     has_math = False
-                    force_ocr = RE_OMITTED_PIC.match(b_text) is not None or "fi fi fi" in b_text or "ﬃ" in b_text
                     
-                    if force_ocr:
-                        # De-duplication: If we JUST injected a formula, and this is another marker, skip
-                        if last_was_math:
-                            continue
-
-                        if form_idx < len(page_formulas):
-                            b_text = page_formulas[form_idx]["latex"]
-                            has_math = True
-                            last_was_math = True
-                            form_idx += 1
-                        else:
-                            # Cleanup: if it's a marker and we have no formula, suppress garbage
-                            b_text = "[Formula/Image]"
-                            has_math = True
-                    else:
-                        last_was_math = False
-                        
-                    if not has_math and (RE_FORMULA.search(b_text) or RE_FORMULA_SHARD.search(b_text)):
+                    if RE_OMITTED_PIC.match(b_text) and form_idx < len(page_formulas):
+                        b_text = page_formulas[form_idx]["latex"]
+                        has_math = True
+                        form_idx += 1
+                    elif RE_FORMULA.search(b_text):
                         m = re.search(r'\((\d+(\.\d+)?)\)', b_text)
                         matched = False
                         if m:
@@ -483,10 +424,6 @@ def extract_blocks(pdf_path, max_pages=None):
                     elif RE_ISOLATED_META.match(b_text):
                         is_paging = True
                         
-                    # Anti-outlier check
-                    if has_math and ("Table" in b_text or "|" in b_text or b_text.count('\n') > 10):
-                        has_math = False
-
                     btype = "formula" if has_math else identify_block_type(b_text, norm, toc_map)
                     
                     blocks.append({
@@ -499,8 +436,23 @@ def extract_blocks(pdf_path, max_pages=None):
                     })
             continue # Processed via LLM, skip the fast engines for this page!
 
-        # 3. STANDARD FAST ENGINE
-        # Tables were already detected in the Early Pass
+        # 2. STANDARD FAST ENGINE
+        page_p = doc_p.pages[i]
+        
+        # 1. Detect Tables on the current page using pdfplumber
+        t_tab0 = time.time()
+        tables = page_p.find_tables()
+        t_table_ext += time.time() - t_tab0
+        
+        table_rects = [tab.bbox for tab in tables]
+        table_count += len(table_rects)
+        
+        def intersects_any_table(b_rect):
+            r1 = fitz.Rect(b_rect)
+            for t_bbox in table_rects:
+                if r1.intersects(fitz.Rect(t_bbox)):
+                    return True
+            return False
 
         # 2. Extract standard text blocks
         # get_text("blocks") returns tuples: (x0, y0, x1, y1, "text", block_no, block_type)
@@ -561,11 +513,6 @@ def extract_blocks(pdf_path, max_pages=None):
                     is_paging = True
                 elif RE_ISOLATED_META.match(b_text):
                     is_paging = True
-
-                # Anti-outlier check
-                # Anti-outlier check
-                if has_math and ("Table" in b_text or "|" in b_text or b_text.count('\n') > 10):
-                    has_math = False
 
                 btype = "formula" if has_math else identify_block_type(b_text, norm, toc_map)
 
