@@ -19,11 +19,18 @@ import torch
 from multiprocessing import Pool
 
 # ─────────────────────────────────────────
-# Determinism & Globals
+# Torch & Device Setup
 # ─────────────────────────────────────────
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+else:
+    DEVICE = "cpu"
+
 torch.manual_seed(0)
 np.random.seed(0)
-if torch.cuda.is_available():
+if DEVICE == "cuda":
     torch.cuda.manual_seed_all(0)
     # Use deterministic algorithms if available, but avoid crashing if not
     try:
@@ -267,8 +274,16 @@ def _init_surya():
     from surya.recognition import RecognitionPredictor
     from surya.common.surya.schema import TaskNames
     TaskNames_cls = TaskNames
-    print("\n\n[OCR] Surya Convolutional Math Engine loading into GPU/Memory...")
-    texify_predictor = RecognitionPredictor(FoundationPredictor())
+    print(f"\n\n[OCR] Surya Engine detected device: {DEVICE}")
+    print(f"[OCR] Surya Convolutional Math Engine loading into {DEVICE}...")
+    
+    try:
+        # Attempt to pass device directly
+        texify_predictor = RecognitionPredictor(FoundationPredictor(device=DEVICE))
+    except Exception as e:
+        print(f"[OCR] Surya initialization warning (falling back to auto): {e}")
+        texify_predictor = RecognitionPredictor(FoundationPredictor())
+        
     _surya_initialized = True
 
 def _surya_batch_process(batch_data):
