@@ -372,10 +372,8 @@ def extract_blocks(pdf_path, max_pages=None):
         
         # 1. Detect Tables on the current page using PyMuPDF (Early Pass)
         t_tab0 = time.time()
-        # Use default strategy first, then fallback to 'text' if needed (optimized scan)
-        tabs = page.find_tables()
-        if not tabs.tables:
-             tabs = page.find_tables(strategy="text")
+        # Using 'text' strategy by default to ensure no borderless tables are missed
+        tabs = page.find_tables(strategy="text")
         
         t_table_ext += time.time() - t_tab0
         
@@ -511,7 +509,7 @@ def extract_blocks(pdf_path, max_pages=None):
         route_to_llm = False
         entropy = layout_entropy(raw_text_blocks)
         
-        if has_caption or entropy > 300.0:
+        if has_caption or entropy > 150.0:
             route_to_llm = True
             llm_linger = 1
         elif llm_linger > 0:
@@ -594,7 +592,7 @@ def extract_blocks(pdf_path, max_pages=None):
                         "dropped": is_paging,
                         "drop_reason": "paging" if is_paging else None,
                     })
-            continue # Processed via LLM, skip the fast engines for this page!
+            continue # Processed via LLM (includes tables), skip standard branches!
 
         # 3. STANDARD FAST ENGINE
         # Extract standard text blocks
@@ -675,7 +673,8 @@ def extract_blocks(pdf_path, max_pages=None):
                     "drop_reason": "paging" if is_paging else None,
                 })
         
-        # 3. Append Tables to the end of the page blocks
+        # 3. Append Tables ONLY for pages that used the Fast Native branch
+        # (The LLM branch already handles tables via Markdown conversion)
         for tab in tabs.tables:
             data = tab.extract()
             if data and len(data) > 1:
@@ -782,7 +781,7 @@ def run(pdf_path, out_path="output.json", max_pages=None):
     blocks, toc_map, n_tabs, t_tabs, t_llm, p_llm = extract_blocks(pdf_path, max_pages=max_pages)
     t_ext = time.time() - t0 - t_tabs - t_llm
     stats.append(("Text Extraction", t_ext, sum(1 for b in blocks if b["dropped"]), 0))
-    stats.append(("Table Engine (pdfplumber)", t_tabs, 0, n_tabs))
+    stats.append(("Table Engine (fitz)", t_tabs, 0, n_tabs))
     stats.append((f"LLM Engine ({p_llm} Pages)", t_llm, 0, 0))
 
     # 2. Frequency Filter
